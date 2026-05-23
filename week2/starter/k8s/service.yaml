@@ -1,0 +1,24 @@
+# Kubernetes Service: expose the Deployment to external traffic
+# Questions to consider:
+# - What service type exposes a public IP? (LoadBalancer, NodePort, ClusterIP?)
+# - Why map port 80 to 8000? (What are these?)
+# - Do you need session affinity? (Why/why not?)
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: demand-api
+  labels:
+    app: demand-api
+
+spec:
+  type: LoadBalancer
+
+  selector:
+    app: demand-api
+
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+    protocol: TCP
