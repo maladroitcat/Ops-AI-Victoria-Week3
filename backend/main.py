@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import data
 
@@ -15,6 +16,17 @@ app.add_middleware(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/health/ready")
+def readiness():
+    status = data.get_data_quality_status()
+    state = status.get("state", "partial")
+    if state == "not_ready":
+        return JSONResponse(status_code=503, content={"status": "not_ready", **status})
+    if state == "partial":
+        return JSONResponse(status_code=200, content={"status": "partial", **status})
+    return {"status": "ready", **status}
 
 
 @app.get("/api/heatmap")

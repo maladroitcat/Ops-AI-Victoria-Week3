@@ -1,0 +1,49 @@
+name: Data Quality Check
+
+on:
+  schedule:
+    - cron: "0 * * * *" # hourly
+  push:
+    branches: [main]
+    paths:
+      - "data/**"
+      - "validation/**"
+      - "backend/data.py"
+      - ".github/workflows/validate-data.yml"
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pandas pyarrow numpy pytest
+
+      - name: Run data quality validation
+        run: |
+          python3 -m validation.check_data_quality \
+            --data data/demand_enriched_corrupted.parquet \
+            --baseline data/demand_enriched_baseline.parquet \
+            --out validation-results.json
+
+      - name: Run data quality tests
+        run: |
+          python3 -m pytest validation/test_data_quality.py -v
+
+      - name: Upload validation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-report
+          path: validation-results.json

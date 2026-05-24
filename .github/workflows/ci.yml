@@ -6,7 +6,6 @@ on:
   push:
     branches:
       - main
-      - week2
       - develop
   pull_request:
     branches:
@@ -29,15 +28,15 @@ jobs:
     - name: Install dependencies
       run: |
         pip install --upgrade pip
-        pip install -r week2/backend/requirements.txt
+        pip install -r backend/requirements.txt
 
     - name: Run lint checks
       run: |
-        python -m compileall week2/backend
+        python -m compileall backend
 
   build:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/week2')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/week3')
 
     steps:
     - name: Checkout code
@@ -52,7 +51,7 @@ jobs:
       uses: docker/build-push-action@v6
       with:
         context: .
-        file: ./week2/starter/Dockerfile
+        file: ./Dockerfile
         push: false
         platforms: linux/amd64
         tags: demand-api:latest
