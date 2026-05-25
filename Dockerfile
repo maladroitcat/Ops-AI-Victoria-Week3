@@ -24,6 +24,7 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 COPY backend/ .
+COPY validation/ /app/validation/
 COPY metadata /app/metadata
 COPY data/processed/demand_enriched.parquet /data/processed/demand_enriched.parquet
 COPY model/lgbm_demand_model.txt /data/processed/lgbm_demand_model.txt

@@ -16,12 +16,23 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from functools import lru_cache
 from validation.check_data_quality import DataQualityValidator
 
-_ROOT = Path(__file__).resolve().parent.parent
-DATA_PATH   = _ROOT / "data" / "processed" / "demand_enriched.parquet"
+_HERE = Path(__file__).resolve().parent
+if (_HERE / "metadata").exists():
+    # Container layout: backend files are copied into /app
+    _ROOT = _HERE
+elif (_HERE.parent / "metadata").exists():
+    # Local repo layout: backend/ is under project root
+    _ROOT = _HERE.parent
+else:
+    _ROOT = _HERE.parent
+_RUNTIME_DATA_DIR = Path("/data/processed")
+_LOCAL_DATA_DIR = _ROOT / "data" / "processed"
+DATA_DIR = _RUNTIME_DATA_DIR if _RUNTIME_DATA_DIR.exists() else _LOCAL_DATA_DIR
+
+DATA_PATH   = DATA_DIR / "demand_enriched.parquet"
 LOOKUP_PATH = _ROOT / "metadata" / "Lookups" / "taxi_zone_lookup.csv"
-MODEL_PATH  = _ROOT / "data" / "processed" / "lgbm_demand_model.txt"
-WEEK3_BASELINE_PATH = _ROOT / "data" / "demand_enriched_baseline.parquet"
-WEEK3_CORRUPTED_PATH = _ROOT / "data" / "demand_enriched_corrupted.parquet"
+MODEL_PATH  = DATA_DIR / "lgbm_demand_model.txt"
+VALIDATION_CUTOFF = pd.Timestamp("2026-01-16")
 
 logger = logging.getLogger(__name__)
 _USE_BASELINE_FORECAST_FALLBACK = False
@@ -152,7 +163,10 @@ def _load_model():
 def _load_full_demand():
     """Load full demand data for lag calculation."""
     print("[NYC Cab Analytics] Loading full demand data for forecasting...")
-    df = pd.read_parquet(DATA_PATH)
+    df = pd.read_parquet(
+        DATA_PATH,
+        columns=["PULocationID", "hour", "trip_count", "time_bucket"],
+    )
     df['time_bucket'] = pd.to_datetime(df['time_bucket'])
     return df
 
@@ -181,8 +195,19 @@ def _execute_validation_and_mitigation() -> dict:
                 agg_map[col] = lambda s: s.mode().iloc[0] if not s.mode().empty else s.iloc[0]
         return df.groupby(key_cols, as_index=False).agg(agg_map)
 
-    baseline_df = pd.read_parquet(WEEK3_BASELINE_PATH)
-    current_df = pd.read_parquet(WEEK3_CORRUPTED_PATH)
+    full_df = pd.read_parquet(
+        DATA_PATH,
+        columns=["PULocationID", "time_bucket", "trip_count", "is_holiday", "lag_1h"],
+    ).copy()
+    full_df["time_bucket"] = pd.to_datetime(full_df["time_bucket"], errors="coerce")
+    baseline_df = full_df[full_df["time_bucket"] < VALIDATION_CUTOFF].copy()
+    current_df = full_df[full_df["time_bucket"] >= VALIDATION_CUTOFF].copy()
+    if baseline_df.empty or current_df.empty:
+        return {
+            "state": "not_ready",
+            "reason": "validation_window_empty",
+            "num_issues": 1,
+        }
     validator = DataQualityValidator(baseline_df)
     result = validator.validate(current_df)
     logger.warning(
@@ -252,7 +277,7 @@ def _execute_validation_and_mitigation() -> dict:
             "[Week3 Data Quality] lag correlation drift detected; fallback strategy: prioritize stable baseline features."
         )
 
-    out_path = _ROOT / "data" / "demand_enriched_sanitized.parquet"
+    out_path = DATA_DIR / "demand_enriched_sanitized.parquet"
     cleaned.to_parquet(out_path, index=False)
     logger.warning("[Week3 Data Quality] sanitized data written to %s", out_path)
 
@@ -334,7 +359,7 @@ def _baseline_forecast_value(zone_id: int, hour: int, dow: int, holiday_name: st
 def _load_zone_hour_fares():
     """Load average fare per zone-hour from preprocessed data."""
     try:
-        fare_path = _ROOT / "data" / "processed" / "zone_hour_avg_fare.parquet"
+        fare_path = DATA_DIR / "zone_hour_avg_fare.parquet"
         df = pd.read_parquet(fare_path)
         # Create lookup: {(zone_id, hour): avg_fare}
         return dict(zip(zip(df['zone_id'], df['hour']), df['avg_fare']))
@@ -360,7 +385,7 @@ def _get_zone_hour_fare(zone_id: int, hour: int) -> float:
 def _load_zone_coordinates():
     """Load zone centroids from geojson for OSRM routing."""
     try:
-        geojson_path = _ROOT / "app" / "frontend" / "public" / "taxi_zones.geojson"
+        geojson_path = _ROOT / "frontend" / "public" / "taxi_zones.geojson"
         with open(geojson_path) as f:
             geojson = json.load(f)
 
@@ -440,26 +465,20 @@ def _compute_zone_volatility():
     Used to flag high-volatility zones where surge pricing is risky.
     Returns dict: (zone_id, hour) -> volatility_ratio (0-1, higher = more volatile)
     """
-    volatility = {}
-
     if _full_demand is None or _full_demand.empty:
-        return volatility
+        return {}
 
-    for zone_id in _profile['PULocationID'].unique():
-        for hour in range(24):
-            hour_data = _full_demand[
-                (_full_demand['PULocationID'] == zone_id) &
-                (_full_demand['hour'] == hour)
-            ]['trip_count']
-
-            if len(hour_data) > 1:
-                mean_demand = hour_data.mean()
-                std_demand = hour_data.std()
-                # Volatility ratio: std / mean (0-1, higher = more volatile)
-                ratio = (std_demand / mean_demand) if mean_demand > 0 else 0
-                volatility[(zone_id, hour)] = ratio
-
-    return volatility
+    grouped = (
+        _full_demand.groupby(["PULocationID", "hour"])["trip_count"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+    )
+    grouped = grouped[grouped["count"] > 1].copy()
+    grouped["ratio"] = np.where(grouped["mean"] > 0, grouped["std"] / grouped["mean"], 0.0)
+    return {
+        (int(r.PULocationID), int(r.hour)): float(r.ratio)
+        for r in grouped.itertuples(index=False)
+    }
 
 
 _zone_volatility = _compute_zone_volatility()
@@ -475,21 +494,11 @@ def _compute_zone_unmet_demand_baseline():
 
     Returns dict: zone_id -> 75th percentile demand value (threshold for "tight")
     """
-    unmet_baselines = {}
-
     if _profile is None or _profile.empty:
-        return unmet_baselines
+        return {}
 
-    for zone_id in _profile['PULocationID'].unique():
-        zone_profile_demand = _profile[_profile['PULocationID'] == zone_id]['avg']
-
-        if len(zone_profile_demand) > 0:
-            # Get 75th percentile - represents "normal busy" demand
-            # Anything above this suggests understaffing/unmet demand
-            p75 = zone_profile_demand.quantile(0.75)
-            unmet_baselines[zone_id] = p75
-
-    return unmet_baselines
+    p75 = _profile.groupby("PULocationID")["avg"].quantile(0.75)
+    return {int(zone_id): float(val) for zone_id, val in p75.items()}
 
 
 _zone_unmet_baselines = _compute_zone_unmet_demand_baseline()
@@ -677,6 +686,19 @@ def forecast_demand(zone_id: int, hour: int, dow: int, num_steps: int = 16, date
     
     # Get zone metadata
     zone_info = _zone_map.get(zone_id, {})
+    zone_data = _full_demand[_full_demand['PULocationID'] == zone_id]
+    if zone_data.empty:
+        return []
+
+    def _safe_zone_value(column: str, fallback):
+        if column in zone_data.columns and pd.notna(zone_data[column].iloc[0]):
+            return zone_data[column].iloc[0]
+        return fallback
+
+    last_borough_id = int(_safe_zone_value('borough_id', 0))
+    last_service_zone_id = int(_safe_zone_value('service_zone_id', 0))
+    is_airport = int(_safe_zone_value('is_airport_zone', 1 if zone_id in AIRPORT_ZONES else 0))
+    zone_slot_baseline = float(_safe_zone_value('zone_slot_baseline', 0.0))
     
     # Get synthetic current demand to use as baseline for lags
     synthetic_current = _generate_synthetic_current_demand(hour, dow)
@@ -700,23 +722,14 @@ def forecast_demand(zone_id: int, hour: int, dow: int, num_steps: int = 16, date
                 synthetic_history.append({
                     'time_bucket': past_time,
                     'trip_count': past_demand,
-                    'borough_id': int(_full_demand[_full_demand['PULocationID'] == zone_id]['borough_id'].iloc[0]) if len(_full_demand[_full_demand['PULocationID'] == zone_id]) > 0 else 0,
-                    'service_zone_id': int(_full_demand[_full_demand['PULocationID'] == zone_id]['service_zone_id'].iloc[0]) if len(_full_demand[_full_demand['PULocationID'] == zone_id]) > 0 else 0,
+                    'borough_id': last_borough_id,
+                    'service_zone_id': last_service_zone_id,
                     'is_airport_zone': 1 if zone_id in AIRPORT_ZONES else 0,
-                    'zone_slot_baseline': float(_full_demand[_full_demand['PULocationID'] == zone_id]['zone_slot_baseline'].iloc[0]) if len(_full_demand[_full_demand['PULocationID'] == zone_id]) > 0 else 0.0,
+                    'zone_slot_baseline': zone_slot_baseline,
                 })
     
     synthetic_history_df = pd.DataFrame(synthetic_history)
     
-    # Get zone metadata from actual data
-    zone_data = _full_demand[_full_demand['PULocationID'] == zone_id]
-    if zone_data.empty:
-        return []
-    
-    last_borough_id = int(zone_data['borough_id'].iloc[0])
-    last_service_zone_id = int(zone_data['service_zone_id'].iloc[0])
-    is_airport = int(zone_data['is_airport_zone'].iloc[0])
-    zone_slot_baseline = float(zone_data['zone_slot_baseline'].iloc[0])
     is_holiday = 0
     cbd_pricing_active = 0
     

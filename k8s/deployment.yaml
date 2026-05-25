@@ -37,7 +37,7 @@ spec:
           - |
             # Authenticate using service account key
             gcloud auth activate-service-account --key-file=/var/secrets/gcs/key.json
-            gsutil cp gs://${GCS_BUCKET}/demand_enriched.parquet /data/processed/
+            gsutil cp gs://${GCS_BUCKET}/demand_enriched_corrupted.parquet /data/processed/demand_enriched.parquet
             gsutil cp gs://${GCS_BUCKET}/lgbm_demand_model.txt /data/processed/
             gsutil cp gs://${GCS_BUCKET}/zone_hour_avg_fare.parquet /data/processed/
             gsutil cp gs://${GCS_BUCKET}/taxi_zones.geojson /data/processed/
